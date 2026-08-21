@@ -1,0 +1,556 @@
+// ──────────────────────────────────────────────────────────────────────────
+// pi-telegram-bridge — bidirectional TUI ↔ Telegram bridge for Pi.
+//
+// Capabilities:
+//   • Notifications (text) and media (photo/file) → Telegram
+//   • Read files/messages from the user's Inbox service
+//   • Relay ask_user_question dialogs to Telegram (blocking) and resolve the
+//     TUI dialog when the user answers in Telegram first.
+//   • Relay permission asks to Telegram and resolve the TUI permission dialog.
+//
+// Bidirectional semantics ("whoever answers first"):
+//   • If the user answers in Telegram → the TUI dialog is closed with that
+//     answer (via the fork-resolve events).
+//   • If the user answers in TUI first → the pending Telegram blocking ask is
+//     aborted and a "user chose …" notification is sent to Telegram.
+// ──────────────────────────────────────────────────────────────────────────
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import {
+  askQuestion,
+  claimInbox,
+  getAvailabilityState,
+  isConfigured,
+  listInbox,
+  onServiceFailure,
+  onServiceSuccess,
+  readInboxFile,
+  sendFile,
+  sendNotify,
+  sendPhoto,
+  sendRichMessage,
+  serviceLikelyUp,
+  subscribeAvailability,
+  probeService,
+  type QuestionOption,
+  type QPayload,
+} from "./api.js";
+import type { QuestionAnswer } from "./types-helpers.js";
+import { agentPrefix, tagHeader } from "./identity.js";
+
+// ── Shared event channel names (forks listen on these) ────────────────────
+const ASK_RESOLVE_EVENT = "pi-telegram-bridge:resolve-ask";
+const PERMISSION_RESOLVE_EVENT = "pi-telegram-bridge:resolve-permission";
+
+// Pending Telegram asks per call, keyed by toolCallId / requestId. Each holds
+// an AbortController so a TUI-first answer can cancel the blocking TG call.
+const pendingAborts = new Map<string, AbortController>();
+const answeredInTui = new Set<string>();
+
+function trackAbort(key: string): { controller: AbortController; resolve: () => void } {
+  const controller = new AbortController();
+  const existing = pendingAborts.get(key);
+  existing?.abort();
+  pendingAborts.set(key, controller);
+  return {
+    controller,
+    resolve: () => pendingAborts.delete(key),
+  };
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export default function telegramBridge(pi: ExtensionAPI) {
+  const configured = isConfigured();
+
+  // ── Footer/status indicator for chat-service availability ─────────────
+  // Shows 🔴/🟢 in pi's status line so it's visible when the Telegram
+  // chat-service is unreachable (and the bridge is in fail-open mode).
+  const STATUS_KEY = "tg-bridge";
+  type CtxLike = { ui?: { setStatus?: (k: string, v: string | undefined) => void } };
+  let currentCtx: CtxLike | undefined;
+
+  const renderStatus = (state: string): string | undefined => {
+    const agent = agentPrefix();
+    if (state === "down") return `${agent} · 🔴 chat-service unavailable`;
+    if (state === "up") return `${agent} · 🟢 chat-service online`;
+    return `${agent} · ⚪ chat-service checking…`;
+  };
+
+  const applyStatus = (state: "up" | "down" | "unknown"): void => {
+    if (!currentCtx?.ui?.setStatus) return;
+    const v = state === "unknown" ? undefined : renderStatus(state);
+    try {
+      currentCtx.ui.setStatus(STATUS_KEY, v);
+    } catch {
+      /* best-effort */
+    }
+  };
+
+  // Capture ctx for setStatus; subscribe to availability transitions.
+  pi.on("session_start", (_event: unknown, ctx: CtxLike) => {
+    currentCtx = ctx as CtxLike;
+    applyStatus(getAvailabilityState());
+    // Probe so the status reflects reality without waiting for a tool call.
+    if (configured) probeService();
+  });
+  subscribeAvailability((state) => applyStatus(state));
+
+  // ── Tools ──────────────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "tg_notify",
+    label: "Send Telegram Notification",
+    description:
+      "Send a plain-text notification to the user via Telegram. Non-blocking. " +
+      "Use for progress updates, alerts, completion messages. " +
+      "No Telegram Markdown escaping needed — plain text is fine, \\n for line breaks. " +
+      "If not configured, this returns an explanatory message instead of failing.",
+    parameters: Type.Object({
+      message: Type.String({ description: "The notification text to send" }),
+      blocks: Type.Optional(
+        Type.Array(Type.Record(Type.String(), Type.Unknown()), {
+          description:
+            "Optional Telegram Rich Message blocks (Bot API 10.2) for styled output " +
+            "(heading/paragraph/table/pre/etc). When provided, overrides the plain `message`. " +
+            "Load the 'telegram-rich-messages' skill first. Table cells are a list of lists.",
+        }),
+      ),
+    }),
+    promptSnippet: "Send a Telegram notification to the user",
+    async execute(
+      _id: string,
+      params: { message: string; blocks?: Record<string, unknown>[] },
+    ): Promise<unknown> {
+      if (!configured || !serviceLikelyUp()) {
+        return notReady("notification", "tg_notify");
+      }
+      try {
+        if (params.blocks && params.blocks.length > 0) {
+          await sendRichMessage(params.blocks);
+        } else {
+          await sendNotify("✉️ " + agentPrefix(), params.message);
+        }
+        return reply("Notification sent to Telegram.");
+      } catch (error) {
+        onServiceFailure();
+        return replyError(error, "tg_notify");
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_send_image",
+    label: "Send Telegram Image",
+    description:
+      "Send an image file (PNG/JPEG/WebP) to the user's Telegram as an inline photo.",
+    parameters: Type.Object({
+      file_path: Type.String({ description: "Absolute path to the image" }),
+      caption: Type.Optional(Type.String({ description: "Optional caption" })),
+    }),
+    promptSnippet: "Send an image to the user's Telegram",
+    async execute(
+      _id: string,
+      params: { file_path: string; caption?: string },
+    ): Promise<unknown> {
+      if (!configured) {
+        return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
+      }
+      try {
+        await sendPhoto(params.file_path, params.caption);
+        return { content: [{ type: "text", text: "Image sent to Telegram." }], details: {} };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_send_file",
+    label: "Send Telegram File",
+    description:
+      "Send any file (PDF, archive, source code, etc.) to the user's Telegram as a document attachment.",
+    parameters: Type.Object({
+      file_path: Type.String({ description: "Absolute path to the file" }),
+      caption: Type.Optional(Type.String({ description: "Optional caption" })),
+    }),
+    promptSnippet: "Send a file to the user's Telegram",
+    async execute(
+      _id: string,
+      params: { file_path: string; caption?: string },
+    ): Promise<unknown> {
+      if (!configured) {
+        return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
+      }
+      try {
+        await sendFile(params.file_path, params.caption);
+        return { content: [{ type: "text", text: "File sent to Telegram." }], details: {} };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_send_rich",
+    label: "Send Rich Telegram Message",
+    description:
+      "Send a structured Telegram Rich Message (Bot API 10.2) built from `blocks`. " +
+      "Use for headings, tables, code blocks, lists, quotes, collages. " +
+      "IMPORTANT: load the 'telegram-rich-messages' skill first — the #1 mistake is " +
+      "that table.cells is a list of lists (each row wrapped in [ ]) and every cell " +
+      "needs {text, align, valign}. collage/slideshow accept ONLY photo blocks.",
+    parameters: Type.Object({
+      blocks: Type.Array(Type.Record(Type.String(), Type.Unknown()), {
+        description:
+          "Rich Message blocks array. Every block needs a \"type\" (heading/paragraph/pre/table/list/blockquote/pullquote/details/divider/footer/collage/slideshow).",
+      }),
+    }),
+    promptSnippet: "Send a structured Rich Telegram message (tables, headings, code, collages)",
+    async execute(
+      _id: string,
+      params: { blocks: Record<string, unknown>[] },
+    ): Promise<unknown> {
+      if (!configured || !serviceLikelyUp()) {
+        return notReady("rich message", "tg_send_rich");
+      }
+      try {
+        await sendRichMessage(params.blocks);
+        return reply("Rich message sent to Telegram.");
+      } catch (error) {
+        onServiceFailure();
+        return replyError(error, "tg_send_rich");
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_inbox_list",
+    label: "List Telegram Inbox",
+    description:
+      "List files and attachments the user sent to the agent's Telegram Inbox.",
+    parameters: Type.Object({}),
+    promptSnippet: "List files available in the Telegram Inbox",
+    async execute(): Promise<unknown> {
+      if (!configured) {
+        return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
+      }
+      try {
+        const inbox = await listInbox();
+        if (inbox.status === "empty" || inbox.files_count === 0) {
+          return { content: [{ type: "text", text: "Inbox is empty." }], details: inbox };
+        }
+        const lines = inbox.files.map(
+          (f) => `• ${f.name} (${fmtSize(f.size)}) — id: ${f.file_id}`,
+        );
+        return {
+          content: [{ type: "text", text: `Inbox (${inbox.files_count}):\n${lines.join("\n")}` }],
+          details: inbox,
+        };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_inbox_read",
+    label: "Read Telegram Inbox File",
+    description:
+      "Download a file from the Telegram Inbox by its file_id (from tg_inbox_list). " +
+      "Saves to /tmp and returns the local path plus a text preview when the file is text.",
+    parameters: Type.Object({
+      file_id: Type.String({ description: "File id from tg_inbox_list" }),
+    }),
+    promptSnippet: "Download and read a file from the Telegram Inbox",
+    async execute(_id: string, params: { file_id: string }): Promise<unknown> {
+      if (!configured) {
+        return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
+      }
+      try {
+        const f = await readInboxFile(params.file_id);
+        const detail = `File saved: ${f.path}\n   Name: ${f.name}\n   Type: ${f.contentType}\n   Size: ${fmtSize(f.size)}`;
+        const preview = f.text ? `\n\n--- Preview ---\n${f.text}\n...` : "";
+        return { content: [{ type: "text", text: `${detail}${preview}` }], details: f };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_inbox_claim",
+    label: "Clear Telegram Inbox",
+    description:
+      "Delete ALL files currently waiting in the Telegram Inbox (destructive). Returns how many were removed.",
+    parameters: Type.Object({}),
+    promptSnippet: "Clear all files from the Telegram Inbox",
+    async execute(): Promise<unknown> {
+      if (!configured) {
+        return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
+      }
+      try {
+        const result = await claimInbox();
+        return {
+          content: [{ type: "text", text: `Inbox cleared: ${result.files_removed} file(s) removed.` }],
+          details: result,
+        };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "tg_ask",
+    label: "Ask User via Telegram",
+    description:
+      "Send a structured question with options to the user's Telegram and BLOCK until they answer. " +
+      "Use when you need a decision from the user via Telegram (specifically when the user is not at the terminal).",
+    parameters: Type.Object({
+      question: Type.String({ description: "The question text" }),
+      header: Type.Optional(Type.String({ description: "Short tag/chip, e.g. 'Approach'" })),
+      options: Type.Array(
+        Type.Object({
+          label: Type.String({ description: "Option label (1-5 words)" }),
+          description: Type.String({ description: "Option description" }),
+        }),
+        { description: "2-4 answer options" },
+      ),
+      multiple: Type.Optional(Type.Boolean({ description: "Allow multiple answers" })),
+      blocks: Type.Optional(
+        Type.Array(Type.Record(Type.String(), Type.Unknown()), {
+          description:
+            "Optional Rich Message blocks to render the question (Bot API 10.2). " +
+            "Load 'telegram-rich-messages' skill first. When present, the question body is built from these blocks.",
+        }),
+      ),
+    }),
+    promptSnippet: "Ask the user a question via Telegram and wait for an answer",
+    async execute(
+      _id: string,
+      params: {
+        question: string;
+        header?: string;
+        options: Array<{ label: string; description: string }>;
+        multiple?: boolean;
+        blocks?: Record<string, unknown>[];
+      },
+    ): Promise<unknown> {
+      if (!configured || !serviceLikelyUp()) {
+        return notReady("question", "tg_ask");
+      }
+      try {
+        const q: QPayload = {
+          header: params.header ?? "Pi Question",
+          question: params.question,
+          options: params.options,
+          multiple: params.multiple ?? false,
+        };
+        if (params.blocks && params.blocks.length > 0) q.blocks = params.blocks;
+        const res = await askQuestion(`pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, [q]);
+        if (res.status === "timeout" || res.status === "stopped") {
+          return reply(`Question ended with status: ${res.status}`);
+        }
+        return reply(`User answered: ${res.answer ?? "(no answer)"}`);
+      } catch (error) {
+        onServiceFailure();
+        return replyError(error, "tg_ask");
+      }
+    },
+  });
+
+  if (!configured) return;
+
+  // ── ask_user_question relay ────────────────────────────────────────────
+  pi.events.on("rpiv:ask-user:prompt", (data: unknown) => {
+    void relayAsk(payload(data));
+  });
+
+  async function relayAsk(p: {
+    toolCallId?: string;
+    questions: Array<{
+      question: string;
+      header: string;
+      multiSelect: boolean;
+      options: Array<{ label: string; description: string }>;
+    }>;
+  }) {
+    if (!p || !p.questions?.length) return;
+    // Skip if this ask was already answered in TUI (no pending work).
+    if (answeredInTui.has(p.toolCallId ?? "")) return;
+    // Fail open when chat-service is down: let the TUI dialog handle it.
+    if (!serviceLikelyUp()) return;
+
+    const sessionId = `pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tgQuestions: QPayload[] = p.questions.map((q) => ({
+      header: tagHeader(q.header),
+      question: q.question,
+      multiple: q.multiSelect,
+      options: q.options.length > 0 ? q.options : [{ label: "OK", description: "Acknowledge" }],
+    }));
+
+    const key = p.toolCallId ?? "ask";
+    const { controller, resolve } = trackAbort(key);
+    try {
+      const res = await askQuestion(sessionId, tgQuestions, { signal: controller.signal });
+      // If this call was aborted because the user answered in TUI, ignore.
+      if (controller.signal.aborted || answeredInTui.has(key)) {
+        answeredInTui.delete(key);
+        return;
+      }
+      // Map TG answers back to TUI answers (one per question).
+      const answers: QuestionAnswer[] = p.questions.map((q, i) => ({
+        questionIndex: i,
+        question: q.question,
+        kind: q.multiSelect ? "multi" : "option",
+        answer: res.results?.[i]?.answer ?? res.answer,
+        // multi-select: collect all result answers per index
+        selected: q.multiSelect && res.results
+          ? res.results.filter((r) => r.question_index === i && r.answer).map((r) => r.answer!)
+          : undefined,
+      }));
+      // Resolve the TUI dialog with these answers.
+      pi.events.emit(ASK_RESOLVE_EVENT, { toolCallId: key, answers });
+    } catch (error) {
+      // Expected: the blocking TG call was aborted because the user answered
+      // in TUI first. Nothing to do — the TUI dialog already produced answers.
+      if (isAbortError(error)) {
+        answeredInTui.delete(key);
+        return;
+      }
+      // Real failure (service down, 5xx). Fail open: leave TUI in charge.
+      onServiceFailure();
+    } finally {
+      resolve();
+    }
+  }
+
+  // Detect a TUI-first answer for ask_user_question: blocked:false ends the wait.
+  pi.events.on("rpiv:ask-user:blocked", (data: unknown) => {
+    const p = payload(data) as { active?: boolean };
+    if (p?.active === false) {
+      // The TUI dialog ended (answered or cancelled). Abort any pending TG
+      // ask and, if we know which, notify Telegram that the user chose.
+      for (const [key, controller] of pendingAborts) {
+        answeredInTui.add(key);
+        controller.abort();
+        void sendNotify(agentPrefix(), "Answer received in terminal (TUI) — this question is closed in Telegram.").catch(() => {});
+      }
+      pendingAborts.clear();
+    }
+  });
+
+  // ── permission relay ───────────────────────────────────────────────────
+  pi.events.on("permissions:ui_prompt", (data: unknown) => {
+    void relayPermission(payload(data));
+  });
+
+  async function relayPermission(p: {
+    requestId?: string;
+    surface?: string | null;
+    value?: string | null;
+    message?: string;
+  }) {
+    if (!p || !p.requestId) return;
+    const key = p.requestId;
+    if (answeredInTui.has(key)) return;
+    // Fail open when chat-service is down: let the TUI permission dialog handle it.
+    if (!serviceLikelyUp()) return;
+
+    const qText = p.message ?? `${p.surface ?? "tool"}: ${p.value ?? ""}`;
+    const sessionId = `pi-perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const opts: QuestionOption[] = [
+      { label: "Allow", description: "Approve this action" },
+      { label: "Deny", description: "Block this action" },
+    ];
+    const { controller, resolve } = trackAbort(key);
+    try {
+      const res = await askQuestion(sessionId, [
+        { header: tagHeader("Permission Required"), question: qText, options: opts },
+      ], { signal: controller.signal });
+      if (controller.signal.aborted || answeredInTui.has(key)) {
+        answeredInTui.delete(key);
+        return;
+      }
+      const decision = res.answer?.toLowerCase().includes("allow")
+        ? { approved: true, state: "approved" as const }
+        : { approved: false, state: "denied" as const };
+      pi.events.emit(PERMISSION_RESOLVE_EVENT, { requestId: key, decision });
+    } catch (error) {
+      // Expected: aborted because the user answered in TUI first.
+      if (isAbortError(error)) {
+        answeredInTui.delete(key);
+        return;
+      }
+      onServiceFailure();
+    } finally {
+      resolve();
+    }
+  }
+
+  // Detect a TUI-first permission decision (permissions:decision) and notify TG.
+  pi.events.on("permissions:decision", (data: unknown) => {
+    const p = payload(data) as {
+      requestId?: string;
+      resolution?: string;
+      surface?: string | null;
+      value?: string | null;
+    };
+    if (!p || !p.requestId) return;
+    const key = p.requestId;
+    if (p.resolution?.startsWith("user_") || p.resolution === "session_approved") {
+      answeredInTui.add(key);
+      pendingAborts.get(key)?.abort();
+      pendingAborts.delete(key);
+      const what = p.surface && p.value ? `${p.surface}: ${p.value}` : p.surface ?? "request";
+      void sendNotify(agentPrefix(), `Permission resolved in TUI (${p.resolution}): ${what}`).catch(() => {});
+    }
+  });
+}
+
+// Loose payload accessor (the steered event emitter delivers unknown-shaped data).
+function payload(data: unknown): Record<string, unknown> {
+  return (data && typeof data === "object" ? data as Record<string, unknown> : {}) as Record<string, unknown>;
+}
+
+// ── Small result helpers (graceful degradation) ───────────────────────────
+
+function reply(text: string): unknown {
+  return { content: [{ type: "text" as const, text }], details: {} };
+}
+
+function replyError(error: unknown, tool: string): unknown {
+  return {
+    content: [{
+      type: "text" as const,
+      text: `${tool}: ${error instanceof Error ? error.message : String(error)}`,
+    }],
+    details: {},
+  };
+}
+
+/** True for the AbortError thrown by an aborted fetch (planned, not a bug). */
+function isAbortError(error: unknown): boolean {
+  return (
+    error instanceof DOMException && error.name === "AbortError"
+  ) || (
+    typeof error === "object" && error !== null &&
+    (error as { name?: string }).name === "AbortError"
+  );
+}
+
+function notReady(action: string, tool: string): unknown {
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Telegram chat-service currently unreachable — ${action} skipped (${tool}). ` +
+        `The agent should continue without the Telegram notification; nothing was lost.`,
+    }],
+    details: {},
+  };
+}

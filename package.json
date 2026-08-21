@@ -1,0 +1,12 @@
+{
+  "name": "pi-telegram-bridge",
+  "version": "0.1.0",
+  "description": "Bidirectional TUI ↔ Telegram bridge for Pi: notifications, Inbox reads, and question/permission relay through the user's Chat-Service.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "keywords": ["pi", "pi-extension", "telegram", "inbox", "bridge"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
