@@ -30,6 +30,7 @@ import {
   sendPhoto,
   sendRichMessage,
   serviceLikelyUp,
+  stopQuestion,
   subscribeAvailability,
   probeService,
   type QuestionOption,
@@ -45,6 +46,9 @@ const PERMISSION_RESOLVE_EVENT = "pi-telegram-bridge:resolve-permission";
 // Pending Telegram asks per call, keyed by toolCallId / requestId. Each holds
 // an AbortController so a TUI-first answer can cancel the blocking TG call.
 const pendingAborts = new Map<string, AbortController>();
+// Session ids of in-flight chat-service questions, so a TUI-first answer can
+// ask the server to close (edit) the Telegram message via /question/stop.
+const pendingSessionIds = new Map<string, string>();
 const answeredInTui = new Set<string>();
 
 function trackAbort(key: string): { controller: AbortController; resolve: () => void } {
@@ -392,6 +396,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
     if (!serviceLikelyUp()) return;
 
     const sessionId = `pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pendingSessionIds.set(key, sessionId);
     const tgQuestions: QPayload[] = p.questions.map((q) => ({
       header: tagHeader(q.header),
       question: q.question,
@@ -431,6 +436,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
       // Real failure (service down, 5xx). Fail open: leave TUI in charge.
       onServiceFailure();
     } finally {
+      pendingSessionIds.delete(key);
       resolve();
     }
   }
@@ -444,9 +450,13 @@ export default function telegramBridge(pi: ExtensionAPI) {
       for (const [key, controller] of pendingAborts) {
         answeredInTui.add(key);
         controller.abort();
+        // Ask the server to close the Telegram message (edit + drop keyboard).
+        const sid = pendingSessionIds.get(key);
+        if (sid) void stopQuestion(sid).catch(() => {});
         void sendNotify(agentPrefix(), "Answer received in terminal (TUI) — this question is closed in Telegram.").catch(() => {});
       }
       pendingAborts.clear();
+      pendingSessionIds.clear();
     }
   });
 
@@ -469,6 +479,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
 
     const qText = p.message ?? `${p.surface ?? "tool"}: ${p.value ?? ""}`;
     const sessionId = `pi-perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pendingSessionIds.set(key, sessionId);
     const opts: QuestionOption[] = [
       { label: "Allow", description: "Approve this action" },
       { label: "Deny", description: "Block this action" },
@@ -494,6 +505,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
       }
       onServiceFailure();
     } finally {
+      pendingSessionIds.delete(key);
       resolve();
     }
   }
@@ -512,6 +524,10 @@ export default function telegramBridge(pi: ExtensionAPI) {
       answeredInTui.add(key);
       pendingAborts.get(key)?.abort();
       pendingAborts.delete(key);
+      // Ask the server to close the Telegram message (edit + drop keyboard).
+      const sid = pendingSessionIds.get(key);
+      if (sid) void stopQuestion(sid).catch(() => {});
+      pendingSessionIds.delete(key);
       const what = p.surface && p.value ? `${p.surface}: ${p.value}` : p.surface ?? "request";
       void sendNotify(agentPrefix(), `Permission resolved in TUI (${p.resolution}): ${what}`).catch(() => {});
     }

@@ -21,6 +21,7 @@ export const ENDPOINTS = {
   sendPhoto: `${API_PREFIX}/send-photo`,
   sendFile: `${API_PREFIX}/send-file`,
   question: `${API_PREFIX}/question`,
+  questionStop: `${API_PREFIX}/question/stop`,
   inbox: `${API_PREFIX}/inbox`,
   inboxFile: (id: string) => `${API_PREFIX}/inbox/files/${id}`,
   inboxClaim: `${API_PREFIX}/inbox/claim`,
@@ -279,6 +280,21 @@ export function askQuestion(
     json: { session_id: sessionId, questions },
     timeoutMs: opts.timeoutMs ?? TIMEOUT_MS,
     signal: opts.signal,
+  });
+}
+
+/**
+ * Best-effort cancel of a pending question session on the server (the server
+ * then edits the Telegram message to "stopped" and removes the buttons).
+ * Used when the user answered the same question in the TUI first.
+ */
+export function stopQuestion(
+  sessionId: string,
+): Promise<{ status: string; stopped: boolean }> {
+  return request<{ status: string; stopped: boolean }>(ENDPOINTS.questionStop, {
+    method: "POST",
+    json: { session_id: sessionId },
+    timeoutMs: 10_000,
   });
 }
 
