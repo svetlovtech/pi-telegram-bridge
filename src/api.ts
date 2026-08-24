@@ -89,12 +89,18 @@ async function request<T>(path: string, opts: ApiOptions = {}): Promise<T> {
     throw error;
   }
 
-  // Any non-throwing response (incl. 4xx/5xx) means the service is reachable.
-  onServiceSuccess();
+  // Only a successful (2xx) response means chat-service is truly serving our
+  // endpoints from this URL. A 404/5xx means the routes don't exist (e.g. the
+  // URL points at the wrong host/proxy), so we must NOT report "online" —
+  // otherwise the footer shows green while delivery keeps failing. Treat any
+  // non-2xx as a failure so the availability state (and footer indicator)
+  // stays honest.
   if (!response.ok) {
+    onServiceFailure();
     const bodyText = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status} from ${path}: ${bodyText}`);
   }
+  onServiceSuccess();
   if (response.status === 204) {
     return undefined as T;
   }
@@ -307,9 +313,11 @@ export async function readInboxFile(fileId: string): Promise<{
     signal: AbortSignal.timeout(60_000),
   });
   if (!response.ok) {
+    onServiceFailure();
     const bodyText = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status} reading inbox file: ${bodyText}`);
   }
+  onServiceSuccess();
   const contentType =
     response.headers.get("content-type") || "application/octet-stream";
   const disposition = response.headers.get("content-disposition") || "";
