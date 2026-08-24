@@ -248,22 +248,59 @@ export function sendPhoto(
   filePath: string,
   caption?: string,
 ): Promise<{ status: string }> {
-  return request<{ status: string }>(ENDPOINTS.sendPhoto, {
-    method: "POST",
-    json: { file_path: filePath, caption },
-    timeoutMs: 120_000,
-  });
+  return uploadAttachment(ENDPOINTS.sendPhoto, filePath, caption);
 }
 
 export function sendFile(
   filePath: string,
   caption?: string,
 ): Promise<{ status: string }> {
-  return request<{ status: string }>(ENDPOINTS.sendFile, {
-    method: "POST",
-    json: { file_path: filePath, caption },
-    timeoutMs: 120_000,
-  });
+  return uploadAttachment(ENDPOINTS.sendFile, filePath, caption);
+}
+
+/**
+ * Attachments travel as multipart/form-data uploads (the Go backend reads the
+ * raw file from the "file" field; no server-local path access).
+ */
+async function uploadAttachment(
+  path: string,
+  filePath: string,
+  caption?: string,
+): Promise<{ status: string }> {
+  const { url, token } = requireConfig();
+  let form: FormData;
+  try {
+    const { readFileSync } = await import("node:fs");
+    const { basename } = await import("node:path");
+    const buffer = readFileSync(filePath);
+    form = new FormData();
+    form.append("file", new Blob([buffer]), basename(filePath));
+    if (caption) form.append("caption", caption);
+  } catch (error) {
+    throw new Error(
+      `cannot read ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${url}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (error) {
+    onServiceFailure();
+    throw error;
+  }
+  if (!response.ok) {
+    onServiceFailure();
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status} from ${path}: ${bodyText}`);
+  }
+  onServiceSuccess();
+  return { status: "sent" };
 }
 
 /**
