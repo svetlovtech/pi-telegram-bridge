@@ -355,7 +355,13 @@ export default function telegramBridge(pi: ExtensionAPI) {
         if (res.status === "timeout" || res.status === "stopped") {
           return reply(`Question ended with status: ${res.status}`);
         }
-        return reply(`User answered: ${res.answer ?? "(no answer)"}`);
+        // Backend returns answers in results[] (per-question); the top-level
+        // answer field is only set by some legacy paths.
+        const answer =
+          res.answer ??
+          res.results?.find((r) => r.answer)?.answer ??
+          "(no answer)";
+        return reply(`User answered: ${answer}`);
       } catch (error) {
         onServiceFailure();
         return replyError(error, "tg_ask");
