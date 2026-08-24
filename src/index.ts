@@ -443,17 +443,18 @@ export default function telegramBridge(pi: ExtensionAPI) {
 
   // Detect a TUI-first answer for ask_user_question: blocked:false ends the wait.
   pi.events.on("rpiv:ask-user:blocked", (data: unknown) => {
-    const p = payload(data) as { active?: boolean };
+    const p = payload(data) as { active?: boolean; summary?: string };
     if (p?.active === false) {
       // The TUI dialog ended (answered or cancelled). Abort any pending TG
-      // ask and, if we know which, notify Telegram that the user chose.
+      // ask, close it server-side and tell Telegram WHAT was answered.
       for (const [key, controller] of pendingAborts) {
         answeredInTui.add(key);
         controller.abort();
         // Ask the server to close the Telegram message (edit + drop keyboard).
         const sid = pendingSessionIds.get(key);
         if (sid) void stopQuestion(sid).catch(() => {});
-        void sendNotify(agentPrefix(), "Answer received in terminal (TUI) — this question is closed in Telegram.").catch(() => {});
+        const detail = p.summary ? `Ответ из терминала: ${p.summary}` : "Вопрос закрыт из терминала.";
+        void sendNotify(agentPrefix(), `📥 ${detail}`).catch(() => {});
       }
       pendingAborts.clear();
       pendingSessionIds.clear();
@@ -529,7 +530,8 @@ export default function telegramBridge(pi: ExtensionAPI) {
       if (sid) void stopQuestion(sid).catch(() => {});
       pendingSessionIds.delete(key);
       const what = p.surface && p.value ? `${p.surface}: ${p.value}` : p.surface ?? "request";
-      void sendNotify(agentPrefix(), `Permission resolved in TUI (${p.resolution}): ${what}`).catch(() => {});
+      const verdict = p.resolution.includes("denied") ? "❌ запрещено" : "✅ разрешено";
+      void sendNotify(agentPrefix(), `🔐 Права из терминала — ${verdict}: ${what}`).catch(() => {});
     }
   });
 }
