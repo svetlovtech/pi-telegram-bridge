@@ -396,7 +396,6 @@ export default function telegramBridge(pi: ExtensionAPI) {
     if (!serviceLikelyUp()) return;
 
     const sessionId = `pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    pendingSessionIds.set(key, sessionId);
     const tgQuestions: QPayload[] = p.questions.map((q) => ({
       header: tagHeader(q.header),
       question: q.question,
@@ -405,6 +404,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
     }));
 
     const key = p.toolCallId ?? "ask";
+    pendingSessionIds.set(key, sessionId);
     const { controller, resolve } = trackAbort(key);
     try {
       const res = await askQuestion(sessionId, tgQuestions, { signal: controller.signal });
