@@ -79,10 +79,10 @@ export default function telegramBridge(pi: ExtensionAPI) {
   let currentCtx: CtxLike | undefined;
 
   const renderStatus = (state: string): string | undefined => {
-    const agent = agentPrefix();
-    if (state === "down") return `${agent} · 🔴 chat-service unavailable`;
-    if (state === "up") return `${agent} · 🟢 chat-service online`;
-    return `${agent} · ⚪ chat-service checking…`;
+    // Compact on purpose: the status row is shared with other extensions.
+    if (state === "down") return "🔴 chat";
+    if (state === "up") return "🟢 chat";
+    return "⚪ chat";
   };
 
   const applyStatus = (state: "up" | "down" | "unknown"): void => {
