@@ -306,16 +306,25 @@ async function uploadAttachment(
 /**
  * Blocking question: sends options to Telegram and waits for the answer.
  * Pass an AbortSignal so a TUI-first answer can cancel this wait.
+ *
+ * Also forwards timeout_seconds so the SERVER-side question lifetime matches
+ * our HTTP wait — otherwise the server gives up after its own default (300s)
+ * while we keep waiting, and the answer arrives onto a closed session.
  */
 export function askQuestion(
   sessionId: string,
   questions: QPayload[],
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<QuestionResponse> {
+  const effectiveMs = opts.timeoutMs ?? TIMEOUT_MS;
   return request<QuestionResponse>(ENDPOINTS.question, {
     method: "POST",
-    json: { session_id: sessionId, questions },
-    timeoutMs: opts.timeoutMs ?? TIMEOUT_MS,
+    json: {
+      session_id: sessionId,
+      questions,
+      timeout_seconds: Math.max(60, Math.round(effectiveMs / 1000)),
+    },
+    timeoutMs: effectiveMs,
     signal: opts.signal,
   });
 }

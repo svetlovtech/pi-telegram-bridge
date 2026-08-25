@@ -356,6 +356,14 @@ export default function telegramBridge(pi: ExtensionAPI) {
         };
         if (params.blocks && params.blocks.length > 0) q.blocks = params.blocks;
         const res = await askQuestion(`pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, [q]);
+        // Batch envelope note: the server always returns top-level status
+        // "success" — the real outcome is per-question in results[].
+        const first = res.results?.[0];
+        if (first && (first.status === "timeout" || first.status === "stopped")) {
+          return reply(
+            `Question ended with status: ${first.status}${first.message ? ` (${first.message})` : ""}`,
+          );
+        }
         if (res.status === "timeout" || res.status === "stopped") {
           return reply(`Question ended with status: ${res.status}`);
         }
