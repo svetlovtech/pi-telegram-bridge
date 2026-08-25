@@ -16,6 +16,7 @@
 // ──────────────────────────────────────────────────────────────────────────
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { appendFileSync } from "node:fs";
 import {
   askQuestion,
   claimInbox,
@@ -50,6 +51,13 @@ const pendingAborts = new Map<string, AbortController>();
 // ask the server to close (edit) the Telegram message via /question/stop.
 const pendingSessionIds = new Map<string, string>();
 const answeredInTui = new Set<string>();
+
+/** Temporary file trace of the ask relay chain (remove once stable). */
+function trace(msg: string): void {
+  try {
+    appendFileSync("/tmp/pi-tg-bridge.log", `${new Date().toISOString()} ${msg}\n`);
+  } catch { /* ignore */ }
+}
 
 function trackAbort(key: string): { controller: AbortController; resolve: () => void } {
   const controller = new AbortController();
@@ -385,6 +393,8 @@ export default function telegramBridge(pi: ExtensionAPI) {
 
   // ── ask_user_question relay ────────────────────────────────────────────
   pi.events.on("rpiv:ask-user:prompt", (data: unknown) => {
+    const p = payload(data) as { toolCallId?: string; questions?: unknown[] } | undefined;
+    trace(`prompt received toolCallId=${p?.toolCallId ?? "?"} questions=${p?.questions?.length ?? 0}`);
     void relayAsk(payload(data));
   });
 
@@ -433,15 +443,18 @@ export default function telegramBridge(pi: ExtensionAPI) {
           : undefined,
       }));
       // Resolve the TUI dialog with these answers.
+      trace(`TG batch complete key=${key} emitting resolve-ask answers=${JSON.stringify(answers).slice(0, 300)}`);
       pi.events.emit(ASK_RESOLVE_EVENT, { toolCallId: key, answers });
+      trace(`resolve-ask emitted key=${key}`);
     } catch (error) {
       // Expected: the blocking TG call was aborted because the user answered
       // in TUI first. Nothing to do — the TUI dialog already produced answers.
       if (isAbortError(error)) {
+        trace(`relayAsk aborted key=${key}`);
         answeredInTui.delete(key);
         return;
       }
-      // Real failure (service down, 5xx). Fail open: leave TUI in charge.
+      trace(`relayAsk error key=${key}: ${error instanceof Error ? error.stack : String(error)}`);
       onServiceFailure();
     } finally {
       pendingSessionIds.delete(key);
