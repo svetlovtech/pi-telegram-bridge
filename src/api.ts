@@ -14,6 +14,9 @@ const SERVICE_TOKEN = process.env.OPENCODE_CHAT_SERVICE_TOKEN;
 const TIMEOUT_MS =
   parseInt(process.env.OPENCODE_CHAT_SERVICE_TIMEOUT || "3600", 10) * 1000;
 
+/** Default blocking-question lifetime, shared with the resilient wrapper. */
+export const CHAT_TIMEOUT_MS = TIMEOUT_MS;
+
 const API_PREFIX = "/api/chat-service";
 export const ENDPOINTS = {
   notify: `${API_PREFIX}/notify`,
@@ -349,6 +352,34 @@ export function stopQuestion(
 
 export function listInbox(): Promise<InboxInfo> {
   return request<InboxInfo>(ENDPOINTS.inbox, { timeoutMs: 30_000 });
+}
+
+/** Shape of GET /response/:session_id (mapAskResponse / batchResultToMap). */
+export interface SessionResponse {
+  status?: string;
+  answer?: string;
+  results?: Array<{
+    question_index: number;
+    question_header?: string;
+    status: string;
+    answer?: string;
+    message?: string;
+  }>;
+  wait_time?: number;
+  session_id?: string;
+  message?: string;
+}
+
+/**
+ * Fetch the current response of a question session. While the batch is still
+ * pending the payload has no top-level `status` — callers treat that as
+ * "not ready yet".
+ */
+export function getSessionResponse(sessionId: string): Promise<SessionResponse> {
+  return request<SessionResponse>(
+    `${API_PREFIX}/response/${encodeURIComponent(sessionId)}`,
+    { method: "GET", timeoutMs: 15_000 },
+  );
 }
 
 /**

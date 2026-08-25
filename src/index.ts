@@ -19,7 +19,9 @@ import { Type } from "typebox";
 import { appendFileSync } from "node:fs";
 import {
   askQuestion,
+  CHAT_TIMEOUT_MS,
   claimInbox,
+  getSessionResponse,
   getAvailabilityState,
   isConfigured,
   listInbox,
@@ -68,6 +70,57 @@ function trackAbort(key: string): { controller: AbortController; resolve: () => 
     controller,
     resolve: () => pendingAborts.delete(key),
   };
+}
+
+/** True when a session-response payload carries the final batch outcome. */
+function isFinalSessionResponse(r: { status?: unknown }): boolean {
+  return typeof r?.status === "string";
+}
+
+/**
+ * Blocking ask with mid-flight disconnect recovery. Long-polling requests can
+ * be silently dropped by middleboxes after ~15-20 minutes of silence; when
+ * that happens the server-side sessions keep running, so instead of failing
+ * we re-attach by polling GET /response/:session_id until an outcome shows up.
+ */
+async function askQuestionResilient(
+  sessionId: string,
+  questions: QPayload[],
+  opts: { signal?: AbortSignal; timeoutMs?: number; trace?: (msg: string) => void } = {},
+): Promise<QuestionResponse> {
+  const timeoutMs = opts.timeoutMs ?? CHAT_TIMEOUT_MS;
+  try {
+    return await askQuestion(sessionId, questions, { signal: opts.signal, timeoutMs });
+  } catch (error) {
+    if (isAbortErrorLocal(error)) throw error;
+    const note = error instanceof Error ? error.message : String(error);
+    opts.trace?.(`transport lost (${note}) — re-attaching via response polling`);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (opts.signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      try {
+        const r = await getSessionResponse(sessionId);
+        if (isFinalSessionResponse(r)) {
+          return r as QuestionResponse;
+        }
+      } catch (pollError) {
+        if (isAbortErrorLocal(pollError)) throw pollError;
+        // transient poll failure — keep retrying until the deadline
+      }
+      await new Promise((r) => setTimeout(r, 3_000));
+    }
+    return { status: "timeout" };
+  }
+}
+
+/** Local abort check (avoids import cycle with helpers below). */
+function isAbortErrorLocal(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (typeof error === "object" && error !== null && (error as { name?: string }).name === "AbortError")
+  );
 }
 
 function fmtSize(bytes: number): string {
@@ -363,7 +416,7 @@ export default function telegramBridge(pi: ExtensionAPI) {
           multiple: params.multiple ?? false,
         };
         if (params.blocks && params.blocks.length > 0) q.blocks = params.blocks;
-        const res = await askQuestion(`pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, [q]);
+        const res = await askQuestionResilient(`pi-ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, [q]);
         // Batch envelope note: the server always returns top-level status
         // "success" — the real outcome is per-question in results[].
         const first = res.results?.[0];
@@ -425,7 +478,10 @@ export default function telegramBridge(pi: ExtensionAPI) {
     pendingSessionIds.set(key, sessionId);
     const { controller, resolve } = trackAbort(key);
     try {
-      const res = await askQuestion(sessionId, tgQuestions, { signal: controller.signal });
+      const res = await askQuestionResilient(sessionId, tgQuestions, {
+        signal: controller.signal,
+        trace: (msg) => trace(`relayAsk key=${key}: ${msg}`),
+      });
       // If this call was aborted because the user answered in TUI, ignore.
       if (controller.signal.aborted || answeredInTui.has(key)) {
         answeredInTui.delete(key);
