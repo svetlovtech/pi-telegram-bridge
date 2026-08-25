@@ -468,6 +468,25 @@ export default function telegramBridge(pi: ExtensionAPI) {
     }
   });
 
+  // Safety net: if the ask_user_question tool call finalizes WITHOUT the
+  // blocked event having cleaned up (e.g. the dialog was declined/cancelled
+  // through a path that never emits rpiv:ask-user:blocked), close the
+  // pending Telegram batch here. Normal Telegram-first resolution removes
+  // its pending entry before this fires, so it no-ops then.
+  pi.on("tool_execution_end", async (event: unknown) => {
+    const p = payload(event) as { toolCallId?: string; toolName?: string };
+    if (!p?.toolCallId || p.toolName !== "ask_user_question") return;
+    const key = p.toolCallId;
+    const controller = pendingAborts.get(key);
+    if (!controller) return; // already resolved / not ours
+    answeredInTui.add(key);
+    controller.abort();
+    const sid = pendingSessionIds.get(key);
+    if (sid) void stopQuestion(sid, "диалог закрыт в терминале").catch(() => {});
+    pendingAborts.delete(key);
+    pendingSessionIds.delete(key);
+  });
+
   // ── permission relay ───────────────────────────────────────────────────
   pi.events.on("permissions:ui_prompt", (data: unknown) => {
     void relayPermission(payload(data));
