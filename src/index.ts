@@ -520,17 +520,17 @@ export default function telegramBridge(pi: ExtensionAPI) {
 
   // Detect a TUI-first answer for ask_user_question: blocked:false ends the wait.
   pi.events.on("rpiv:ask-user:blocked", (data: unknown) => {
-    const p = payload(data) as { active?: boolean; summary?: string };
+    const p = payload(data) as { active?: boolean; summary?: string; perQuestion?: string[] };
     if (p?.active === false) {
       // The TUI dialog ended (answered or cancelled). Abort any pending TG
-      // ask and close it server-side: the server appends the TUI answer
-      // summary INTO the original question message (single-message UX, no
-      // separate "Ответ из терминала" notification).
+      // ask and close it server-side: the server appends each question's own
+      // answer INTO its original message (single-message UX, no separate
+      // "Ответ из терминала" notification).
       for (const [key, controller] of pendingAborts) {
         answeredInTui.add(key);
         controller.abort();
         const sid = pendingSessionIds.get(key);
-        if (sid) void stopQuestion(sid, p.summary).catch(() => {});
+        if (sid) void stopQuestion(sid, p.summary, p.perQuestion).catch(() => {});
       }
       pendingAborts.clear();
       pendingSessionIds.clear();

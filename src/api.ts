@@ -342,10 +342,11 @@ export function askQuestion(
 export function stopQuestion(
   sessionId: string,
   note?: string,
+  notes?: string[],
 ): Promise<{ status: string; stopped: boolean }> {
   return request<{ status: string; stopped: boolean }>(ENDPOINTS.questionStop, {
     method: "POST",
-    json: { session_id: sessionId, note },
+    json: { session_id: sessionId, note, notes },
     timeoutMs: 10_000,
   });
 }
