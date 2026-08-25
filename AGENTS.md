@@ -12,7 +12,9 @@ Bidirectional TUI ↔ Telegram bridge for Pi: notifications, inbox reads,
   - `rpiv:ask-user:prompt` / `rpiv:ask-user:blocked` (emitted by rpiv-ask-user-question)
   - `permissions:ui_prompt` / `permissions:decision` (emitted by pi-permission-system)
   - `pi-telegram-bridge:resolve-ask` / `pi-telegram-bridge:resolve-permission` (consumed by those forks)
-- Service contract: Chat-Service (`POST /question`, blocking; see `src/api.ts`).
+- Service contract: Chat-Service (`POST /question`, blocking; `POST /question/stop`
+  `{session_id, note}` closes pending sessions and appends `note` into the same
+  Telegram question message instead of sending a separate notification; see `src/api.ts`).
 
 Build check:
 

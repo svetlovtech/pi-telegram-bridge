@@ -321,16 +321,19 @@ export function askQuestion(
 }
 
 /**
- * Best-effort cancel of a pending question session on the server (the server
- * then edits the Telegram message to "stopped" and removes the buttons).
+ * Best-effort cancel of a pending question session on the server. The server
+ * cancels the pending session(s) and EDITS the original Telegram question
+ * message: note (e.g. the TUI answer summary) is appended into the same
+ * message and the inline keyboard is dropped — no separate notification.
  * Used when the user answered the same question in the TUI first.
  */
 export function stopQuestion(
   sessionId: string,
+  note?: string,
 ): Promise<{ status: string; stopped: boolean }> {
   return request<{ status: string; stopped: boolean }>(ENDPOINTS.questionStop, {
     method: "POST",
-    json: { session_id: sessionId },
+    json: { session_id: sessionId, note },
     timeoutMs: 10_000,
   });
 }

@@ -446,15 +446,14 @@ export default function telegramBridge(pi: ExtensionAPI) {
     const p = payload(data) as { active?: boolean; summary?: string };
     if (p?.active === false) {
       // The TUI dialog ended (answered or cancelled). Abort any pending TG
-      // ask, close it server-side and tell Telegram WHAT was answered.
+      // ask and close it server-side: the server appends the TUI answer
+      // summary INTO the original question message (single-message UX, no
+      // separate "Ответ из терминала" notification).
       for (const [key, controller] of pendingAborts) {
         answeredInTui.add(key);
         controller.abort();
-        // Ask the server to close the Telegram message (edit + drop keyboard).
         const sid = pendingSessionIds.get(key);
-        if (sid) void stopQuestion(sid).catch(() => {});
-        const detail = p.summary ? `Ответ из терминала: ${p.summary}` : "Вопрос закрыт из терминала.";
-        void sendNotify(agentPrefix(), `📥 ${detail}`).catch(() => {});
+        if (sid) void stopQuestion(sid, p.summary).catch(() => {});
       }
       pendingAborts.clear();
       pendingSessionIds.clear();
@@ -511,7 +510,8 @@ export default function telegramBridge(pi: ExtensionAPI) {
     }
   }
 
-  // Detect a TUI-first permission decision (permissions:decision) and notify TG.
+  // Detect a TUI-first permission decision (permissions:decision) and mirror
+  // it into the Telegram question message via stop-with-note.
   pi.events.on("permissions:decision", (data: unknown) => {
     const p = payload(data) as {
       requestId?: string;
@@ -525,13 +525,12 @@ export default function telegramBridge(pi: ExtensionAPI) {
       answeredInTui.add(key);
       pendingAborts.get(key)?.abort();
       pendingAborts.delete(key);
-      // Ask the server to close the Telegram message (edit + drop keyboard).
+      // Close the Telegram permission question in place (edit + drop keyboard).
       const sid = pendingSessionIds.get(key);
-      if (sid) void stopQuestion(sid).catch(() => {});
       pendingSessionIds.delete(key);
       const what = p.surface && p.value ? `${p.surface}: ${p.value}` : p.surface ?? "request";
       const verdict = p.resolution.includes("denied") ? "❌ запрещено" : "✅ разрешено";
-      void sendNotify(agentPrefix(), `🔐 Права из терминала — ${verdict}: ${what}`).catch(() => {});
+      if (sid) void stopQuestion(sid, `${verdict}: ${what}`).catch(() => {});
     }
   });
 }
