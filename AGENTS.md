@@ -5,6 +5,7 @@ Bidirectional TUI ↔ Telegram bridge for Pi: notifications, inbox reads,
 
 - Loaded by Pi: `~/.pi/agent/settings.json` → `/home/dev/pi-forks/pi-telegram-bridge`
 - GitHub repo (origin): https://github.com/svetlovtech/pi-telegram-bridge (private). Push: `git push origin master`.
+- Workflow: after ANY code change — immediately `git commit` + `git push origin master` in the same turn. Do not wait for a separate "commit and push" request.
 - This is OUR project — there is no upstream to sync. It depends on two local forks:
   - `../rpiv-ask-user-question` — listens for `rpiv:ask-user:prompt` (with `toolCallId`) and emits `pi-telegram-bridge:resolve-ask`.
   - `../pi-permission-system` — listens for `permissions:ui_prompt` and emits `pi-telegram-bridge:resolve-permission` (wired via the `externalResolve` hook in that fork).
