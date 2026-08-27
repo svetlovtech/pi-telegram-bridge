@@ -229,6 +229,12 @@ export interface QPayload {
   options: QuestionOption[];
   multiple?: boolean;
   blocks?: Record<string, unknown>[];
+  /**
+   * Card style: omit or "question" renders a plain agent question (❓);
+   * "permission" renders an execution-permission card (❗, resolves to
+   * ✅ разрешено / ❌ отклонено instead of the answer look).
+   */
+  kind?: string;
 }
 
 export function sendNotify(title: string, body: string): Promise<{ status: string }> {
@@ -335,18 +341,22 @@ export function askQuestion(
 /**
  * Best-effort cancel of a pending question session on the server. The server
  * cancels the pending session(s) and EDITS the original Telegram question
- * message: note (e.g. the TUI answer summary) is appended into the same
- * message and the inline keyboard is dropped — no separate notification.
+ * message in place — no separate notification:
+ *   - selections[i] (option numbers for batch index i): the card closes like
+ *     a normally-answered question — ✅ on the chosen option line plus the
+ *     final title icon (permissions flip to “разрешено/отклонено”).
+ *   - otherwise note/notes are appended as the TUI-answer trail.
  * Used when the user answered the same question in the TUI first.
  */
 export function stopQuestion(
   sessionId: string,
   note?: string,
   notes?: string[],
+  selections?: number[][],
 ): Promise<{ status: string; stopped: boolean }> {
   return request<{ status: string; stopped: boolean }>(ENDPOINTS.questionStop, {
     method: "POST",
-    json: { session_id: sessionId, note, notes },
+    json: { session_id: sessionId, note, notes, selections },
     timeoutMs: 10_000,
   });
 }

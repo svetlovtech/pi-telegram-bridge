@@ -583,7 +583,8 @@ export default function telegramBridge(pi: ExtensionAPI) {
     const { controller, resolve } = trackAbort(key);
     try {
       const res = await askQuestion(sessionId, [
-        { header: tagHeader("Permission Required"), question: qText, options: opts },
+        // kind:"permission" → ❗ «Запрос на выполнение» card on the server.
+        { header: tagHeader("Permission Required"), kind: "permission", question: qText, options: opts },
       ], { signal: controller.signal });
       if (controller.signal.aborted || answeredInTui.has(key)) {
         answeredInTui.delete(key);
@@ -607,10 +608,15 @@ export default function telegramBridge(pi: ExtensionAPI) {
   }
 
   // Detect a TUI-first permission decision (permissions:decision) and mirror
-  // it into the Telegram question message via stop-with-note.
+  // it into the Telegram question message via stop-with-selection: the server
+  // marks the chosen Allow/Deny option with a green checkmark and flips the
+  // card title to “✅ … — разрешено” / “❌ … — отклонено” (same UX as answered
+  // questions). The text verdict is passed as the note so older chat-servers
+  // that ignore `selections` keep appending the readable trail.
   pi.events.on("permissions:decision", (data: unknown) => {
     const p = payload(data) as {
       requestId?: string;
+      result?: string;
       resolution?: string;
       surface?: string | null;
       value?: string | null;
@@ -621,12 +627,15 @@ export default function telegramBridge(pi: ExtensionAPI) {
       answeredInTui.add(key);
       pendingAborts.get(key)?.abort();
       pendingAborts.delete(key);
-      // Close the Telegram permission question in place (edit + drop keyboard).
       const sid = pendingSessionIds.get(key);
       pendingSessionIds.delete(key);
       const what = p.surface && p.value ? `${p.surface}: ${p.value}` : p.surface ?? "request";
-      const verdict = p.resolution.includes("denied") ? "❌ запрещено" : "✅ разрешено";
-      if (sid) void stopQuestion(sid, `${verdict}: ${what}`).catch(() => {});
+      const denied =
+        p.result === "deny" ||
+        (p.result == null && (p.resolution.includes("denied") || p.resolution === "user_deny"));
+      const verdict = denied ? "❌ запрещено" : "✅ разрешено";
+      // Permission card options are always [Allow(1), Deny(2)] above.
+      if (sid) void stopQuestion(sid, `${verdict}: ${what}`, undefined, [[denied ? 2 : 1]]).catch(() => {});
     }
   });
 }
