@@ -41,6 +41,7 @@ import {
 } from "./api.js";
 import type { QuestionAnswer } from "./types-helpers.js";
 import { agentPrefix, tagHeader } from "./identity.js";
+import { formatInboxListing, fmtSize } from "./inbox.js";
 
 // ── Shared event channel names (forks listen on these) ────────────────────
 const ASK_RESOLVE_EVENT = "pi-telegram-bridge:resolve-ask";
@@ -53,6 +54,14 @@ const pendingAborts = new Map<string, AbortController>();
 // ask the server to close (edit) the Telegram message via /question/stop.
 const pendingSessionIds = new Map<string, string>();
 const answeredInTui = new Set<string>();
+
+// ── Inbox freshness (session watermark) ──────────────────────────────────
+// The first tg_inbox_list of a session sets the baseline; later listings
+// show only files that arrived after the previous listing (uploaded_at is
+// the server clock, so this is immune to bridge↔server clock skew).
+// Reset per session.
+let inboxWatermark: number | null = null;
+let sessionStartedAt = new Date();
 
 /** Temporary file trace of the ask relay chain (remove once stable). */
 function trace(msg: string): void {
@@ -123,12 +132,6 @@ function isAbortErrorLocal(error: unknown): boolean {
   );
 }
 
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 export default function telegramBridge(pi: ExtensionAPI) {
   const configured = isConfigured();
 
@@ -160,6 +163,10 @@ export default function telegramBridge(pi: ExtensionAPI) {
   pi.on("session_start", (_event: unknown, ctx: CtxLike) => {
     currentCtx = ctx as CtxLike;
     applyStatus(getAvailabilityState());
+    // New session → fresh inbox baseline: the first listing of the session
+    // shows everything (with ages), later ones only new arrivals.
+    sessionStartedAt = new Date();
+    inboxWatermark = null;
     // Probe so the status reflects reality without waiting for a tool call.
     if (configured) probeService();
   });
@@ -296,25 +303,43 @@ export default function telegramBridge(pi: ExtensionAPI) {
     name: "tg_inbox_list",
     label: "List Telegram Inbox",
     description:
-      "List files and attachments the user sent to the agent's Telegram Inbox.",
-    parameters: Type.Object({}),
-    promptSnippet: "List files available in the Telegram Inbox",
-    async execute(): Promise<unknown> {
+      "List files and attachments the user sent to the agent's Telegram Inbox. " +
+      "Files are newest-first with ages; anything older than the session start is stale — " +
+      "ignore it unless the user asks. By default only files that arrived after your previous " +
+      "listing in this session are shown; pass include_old=true to see the full inbox.",
+    parameters: Type.Object({
+      include_old: Type.Optional(
+        Type.Boolean({
+          description:
+            "Show ALL files including older ones hidden by the session watermark " +
+            "(default: only files newer than your last listing)",
+        }),
+      ),
+    }),
+    promptSnippet: "List files available in the Telegram Inbox (newest first, with ages)",
+    async execute(
+      _id: string,
+      params: { include_old?: boolean },
+    ): Promise<unknown> {
       if (!configured) {
         return { content: [{ type: "text", text: "Telegram bridge not configured." }], details: {} };
       }
       try {
         const inbox = await listInbox();
-        if (inbox.status === "empty" || inbox.files_count === 0) {
+        const files = inbox.files ?? [];
+        if (inbox.status === "empty" || files.length === 0) {
+          inboxWatermark = Date.now();
           return { content: [{ type: "text", text: "Inbox is empty." }], details: inbox };
         }
-        const lines = inbox.files.map(
-          (f) => `• ${f.name} (${fmtSize(f.size)}) — id: ${f.file_id}`,
-        );
-        return {
-          content: [{ type: "text", text: `Inbox (${inbox.files_count}):\n${lines.join("\n")}` }],
-          details: inbox,
-        };
+        const out = formatInboxListing({
+          files,
+          now: new Date(),
+          sessionStartedAt,
+          includeOld: params.include_old === true,
+          watermark: inboxWatermark,
+        });
+        inboxWatermark = out.nextWatermark;
+        return { content: [{ type: "text", text: out.text }], details: { ...inbox, shown: out.shownCount, hidden: out.hiddenCount } };
       } catch (error) {
         return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], details: {} };
       }
@@ -326,7 +351,9 @@ export default function telegramBridge(pi: ExtensionAPI) {
     label: "Read Telegram Inbox File",
     description:
       "Download a file from the Telegram Inbox by its file_id (from tg_inbox_list). " +
-      "Saves to /tmp and returns the local path plus a text preview when the file is text.",
+      "Saves to /tmp and returns the local path plus a text preview when the file is text. " +
+      "Listings are newest-first with ages: anything older than the session start is stale — " +
+      "ignore it unless the user asks.",
     parameters: Type.Object({
       file_id: Type.String({ description: "File id from tg_inbox_list" }),
     }),
