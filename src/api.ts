@@ -3,8 +3,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 // ──────────────────────────────────────────────────────────────────────────
 // pi-telegram-bridge — config + Chat-Service API client
 //
-// Talks to the user's own Chat-Service (the same one the OpenCode telegram
-// plugin uses) over REST. All outbound content is plain Rich-Message text —
+// Talks to the user's own chat-service backend over REST (endpoints under
+// /api/chat-service, Bearer auth) — the service relays messages to Telegram. All outbound content is plain Rich-Message text —
 // no escaping needed. Blocking question calls support an AbortSignal so a
 // TUI-first answer can cancel the Telegram wait.
 // ──────────────────────────────────────────────────────────────────────────

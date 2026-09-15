@@ -4,9 +4,9 @@
 // Derives a short "who is this / what project" prefix so the user can tell in
 // Telegram which agent and which repo a message/question came from.
 //
-// NOTE: The preferred solution is the `agent` field pushed through the
-// Chat-Service (see spec §11). This module is the local fallback that works
-// before the service supports it: we prefix the header/question text.
+// NOTE: The chat-service may provide an `agent` field so the server-side
+// prefix is authoritative; until then this module provides a local fallback:
+// we prefix the header/question text ourselves.
 // ──────────────────────────────────────────────────────────────────────────
 import { basename } from "node:path";
 

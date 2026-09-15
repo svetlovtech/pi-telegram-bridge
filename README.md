@@ -8,20 +8,16 @@ chat-service backend.
 > compatible chat-service backend that exposes the `/api/chat-service/*`
 > endpoints (Bearer auth) and relays messages to Telegram.
 
-## Architecture (src/)
+See [AGENTS.md](AGENTS.md) for the full architecture overview.
 
-- `api.ts` — configuration + chat-service REST client (Bearer auth, blocking
-  question calls with abort support, availability probing, inbox endpoints).
-- `identity.ts` — derives the short `pi · project` prefix so Telegram messages
-  show which agent/repo they came from.
-- `inbox.ts` — formatting helpers for inbox listings (sizes, ages,
-  newest-first ordering, freshness buckets).
-- `index.ts` — extension entry point: registers the `tg_*` tools, subscribes
-  to the event contracts below, and implements the "whoever answers first"
-  bidirectional relay semantics.
-- `types-helpers.ts` — shared types and small helpers.
+## Usage
 
-## Environment variables
+Install into your pi extensions directory and add it to
+`~/.pi/agent/settings.json`. Set the environment variables below so the
+bridge can reach your chat-service, then the `tg_*` tools become available
+to the agent.
+
+### Environment variables
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -32,7 +28,7 @@ chat-service backend.
 Without URL and token the extension loads but reports that it is not
 configured.
 
-## Tools
+### Tools
 
 - `tg_notify` — send a text notification to the owner's Telegram.
 - `tg_send_image` — send a photo (by path or URL).
@@ -42,7 +38,7 @@ configured.
 - `tg_inbox_read` — read an inbox file into the conversation.
 - `tg_inbox_claim` — mark an inbox file as claimed.
 
-## Event contracts
+### Event contracts
 
 Bidirectional dialogs follow "whoever answers first": a Telegram answer
 closes the TUI dialog, and a TUI answer aborts/closes the pending Telegram
