@@ -474,8 +474,15 @@ export default function telegramBridge(pi: ExtensionAPI) {
 
   // Detect a TUI-first answer for ask_user_question: blocked:false ends the wait.
   pi.events.on("rpiv:ask-user:blocked", (data: unknown) => {
-    const p = payload(data) as { active?: boolean; summary?: string; perQuestion?: string[] };
+    const p = payload(data) as {
+      active?: boolean;
+      summary?: string;
+      perQuestion?: string[];
+      /** 1-based selected option indices per question (fork ≥ selections event). */
+      selections?: number[][];
+    };
     if (p?.active === false) {
+      trace(`blocked:false summary=${p.summary ?? "?"} selections=${JSON.stringify(p.selections)}`);
       // The TUI dialog ended (answered or cancelled). Abort any pending TG
       // ask and close it server-side: the server appends each question's own
       // answer INTO its original message (single-message UX, no separate
@@ -484,7 +491,10 @@ export default function telegramBridge(pi: ExtensionAPI) {
         answeredInTui.add(key);
         controller.abort();
         const sid = pendingSessionIds.get(key);
-        if (sid) void stopQuestion(sid, p.summary, p.perQuestion).catch(() => {});
+        // selections → the server marks each chosen option line with a green
+        // checkmark (same UX as permission verdicts); older chat-servers that
+        // ignore `selections` keep appending the perQuestion text trail.
+        if (sid) void stopQuestion(sid, p.summary, p.perQuestion, p.selections).catch(() => {});
       }
       pendingAborts.clear();
       pendingSessionIds.clear();
